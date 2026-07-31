@@ -24,6 +24,16 @@ export function getOrderAccessWhere(
 ): Prisma.B2BOrderWhereInput {
   const companyIds = getAccessibleCompanyIds(user);
   const accessLevel = getSalesOrderAccessLevel(user);
+
+  // Sales users should see all orders for companies assigned to them,
+  // even if they did not create the order themselves.
+  if (user.role === "SALES_USER") {
+    return {
+      companyId: { in: companyIds },
+      orderStatus: { notIn: ["converted", "archived"] },
+    };
+  }
+
   return {
     companyId: { in: companyIds },
     orderStatus: { notIn: ["converted", "archived"] },
@@ -90,6 +100,102 @@ export function getOrderNumber(order: {
       : null) ||
     `ORD-${order.id.slice(-8).toUpperCase()}`
   );
+}
+
+type ShopifyNameLookupOrder = {
+  id: string;
+  shopifyOrderId: string | null;
+  company: {
+    shop: { shopDomain: string; accessToken: string | null } | null;
+  };
+};
+
+/**
+ * Batch-fetches the Shopify order name (e.g. "#1008") for B2B orders using a
+ * single `nodes` query per shop. Falls back to an empty map if anything fails.
+ */
+export async function fetchShopifyOrderNames(
+  orders: ShopifyNameLookupOrder[],
+): Promise<Map<string, string | null>> {
+  const names = new Map<string, string | null>();
+  const byShop = new Map<
+    string,
+    { accessToken: string; entries: Array<{ gid: string; orderId: string }> }
+  >();
+
+  for (const order of orders) {
+    const rawId = order.shopifyOrderId;
+    if (!rawId?.startsWith("gid://shopify/Order/")) continue;
+    const shop = order.company?.shop;
+    if (!shop?.shopDomain || !shop.accessToken) continue;
+    const entry = { gid: rawId, orderId: order.id };
+    const existing = byShop.get(shop.shopDomain);
+    if (existing) {
+      existing.entries.push(entry);
+    } else {
+      byShop.set(shop.shopDomain, {
+        accessToken: shop.accessToken,
+        entries: [entry],
+      });
+    }
+  }
+
+  const query = `
+    query GetShopifyOrderNames($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Order {
+          id
+          name
+        }
+      }
+    }
+  `;
+
+  for (const [shopDomain, { accessToken, entries }] of byShop) {
+    for (let i = 0; i < entries.length; i += 250) {
+      const chunk = entries.slice(i, i + 250);
+      try {
+        const response = await fetch(
+          `https://${shopDomain}/admin/api/2025-01/graphql.json`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Shopify-Access-Token": accessToken,
+            },
+            body: JSON.stringify({
+              query,
+              variables: { ids: chunk.map((entry) => entry.gid) },
+            }),
+          },
+        );
+        const payload = (await response.json()) as {
+          data?: { nodes?: Array<{ id: string; name: string } | null> };
+          errors?: Array<{ message: string }>;
+        };
+        if (payload.errors?.length) {
+          console.warn("[sales-orders] Shopify order name lookup failed", {
+            shopDomain,
+            errors: payload.errors,
+          });
+          continue;
+        }
+        const nodes = payload.data?.nodes || [];
+        nodes.forEach((node) => {
+          if (!node?.id) return;
+          const entry = chunk.find((item) => item.gid === node.id);
+          if (entry) names.set(entry.orderId, node.name || null);
+        });
+      } catch (error) {
+        console.error("[sales-orders] Shopify order name lookup unavailable", {
+          shopDomain,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  return names;
 }
 
 export function isSalesPortalPaymentLinkEligible(order: {

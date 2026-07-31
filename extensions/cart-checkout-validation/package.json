@@ -6,7 +6,7 @@
   "scripts": {
     "shopify": "npm exec -- shopify",
     "typegen": "npm exec -- shopify app function typegen",
-    "build": "npm exec -- shopify app function build",
+    "build": "node init && npm exec -- shopify app function build",
     "preview": "npm exec -- shopify app function run",
     "test": "vitest",
     "test:unit": "vitest run src/"
