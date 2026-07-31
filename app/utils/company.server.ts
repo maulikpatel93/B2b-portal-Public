@@ -18,8 +18,6 @@ type StoreRef = {
   id: string;
 };
 
-
-
 type ShopifyCustomerNode = {
   id: string;
   email?: string | null;
@@ -595,6 +593,13 @@ export const syncShopifyUsers = async (
       } else if (companyId.startsWith("gid://")) {
         targetShopifyCompanyId = companyId;
       }
+
+      if (
+        targetShopifyCompanyId &&
+        !targetShopifyCompanyId.startsWith("gid://")
+      ) {
+        targetShopifyCompanyId = `gid://shopify/Company/${targetShopifyCompanyId}`;
+      }
     }
 
     if (!targetShopifyCompanyId) {
@@ -642,8 +647,27 @@ export const syncShopifyUsers = async (
       variables: { id: targetShopifyCompanyId },
     });
     const payload = await response.json();
+
+    if (payload.errors?.length) {
+      return {
+        success: false,
+        syncedCount: 0,
+        message: `GraphQL error: ${payload.errors[0].message}`,
+        errors: payload.errors.map((e: any) => e.message),
+      };
+    }
+
+    if (!payload?.data?.company) {
+      return {
+        success: false,
+        syncedCount: 0,
+        message: "Company not found in Shopify",
+        errors: [`Company not found in Shopify: ${targetShopifyCompanyId}`],
+      };
+    }
+
     const contacts =
-      payload?.data?.company?.contacts?.edges?.map(
+      payload.data.company.contacts?.edges?.map(
         (edge: { node: Record<string, unknown> }) => edge.node,
       ) || [];
 
@@ -958,6 +982,13 @@ export const syncShopifyOrders = async (
       localCompanyId = localCompany.id;
     }
 
+    if (
+      targetShopifyCompanyId &&
+      !targetShopifyCompanyId.startsWith("gid://")
+    ) {
+      targetShopifyCompanyId = `gid://shopify/Company/${targetShopifyCompanyId}`;
+    }
+
     console.log(targetShopifyCompanyId, localCompanyId, "companyId11111");
     if (!targetShopifyCompanyId || !localCompanyId) {
       return {
@@ -991,28 +1022,58 @@ export const syncShopifyOrders = async (
                       currencyCode
                     }
                   }
-                  customer {
-                    id
-                    firstName
-                    lastName
-                    email
+                  subtotalPriceSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  totalShippingPriceSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  totalTaxSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  currentTotalDiscountSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
                   }
                 }
               }
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
             }
-          }
-        }
-      `;
-
+          `;
       const response = await admin.graphql(orderQuery, {
         variables: { companyId: targetShopifyCompanyId, cursor },
       });
       const result = await response.json();
-      const data = result?.data?.company?.orders;
+
+      if (result.errors?.length) {
+        return {
+          success: false,
+          syncedCount: allOrders.length,
+          errors: result.errors.map((e: any) => e.message),
+          message: `GraphQL error: ${result.errors[0].message}`,
+        };
+      }
+
+      if (!result?.data?.company) {
+        return {
+          success: false,
+          syncedCount: allOrders.length,
+          errors: [`Company not found in Shopify: ${targetShopifyCompanyId}`],
+          message: "Company not found in Shopify",
+        };
+      }
+
+      const data = result.data.company.orders;
 
       if (data?.edges?.length) {
         allOrders = [
@@ -1068,6 +1129,27 @@ export const syncShopifyOrders = async (
           continue;
         }
 
+        const customerName =
+          [order.customer?.firstName, order.customer?.lastName]
+            .filter(Boolean)
+            .join(" ")
+            .trim() || null;
+        const customerEmail = order.customer?.email || null;
+        const currencyCode =
+          order.totalPriceSet?.shopMoney?.currencyCode || "USD";
+        const subtotal = new Decimal(
+          order.subtotalPriceSet?.shopMoney?.amount ?? "0",
+        );
+        const shippingAmount = new Decimal(
+          order.totalShippingPriceSet?.shopMoney?.amount ?? "0",
+        );
+        const taxAmount = new Decimal(
+          order.totalTaxSet?.shopMoney?.amount ?? "0",
+        );
+        const discountTotal = new Decimal(
+          order.currentTotalDiscountSet?.shopMoney?.amount ?? "0",
+        );
+        const orderNumber = order.name || null;
         const paymentStatus = "pending";
         const orderStatus = "payment_pending";
 
@@ -1077,6 +1159,14 @@ export const syncShopifyOrders = async (
           },
           update: {
             orderTotal: totalAmount,
+            customerName,
+            customerEmail,
+            orderNumber,
+            currencyCode,
+            subtotal,
+            shippingAmount,
+            taxAmount,
+            discountTotal,
             updatedAt: new Date(),
           },
           create: {
@@ -1091,6 +1181,14 @@ export const syncShopifyOrders = async (
             orderStatus,
             remainingBalance: new Decimal(0),
             paidAmount: new Decimal(0),
+            orderNumber,
+            customerName,
+            customerEmail,
+            currencyCode,
+            subtotal,
+            shippingAmount,
+            taxAmount,
+            discountTotal,
             createdAt: order.createdAt ? new Date(order.createdAt) : new Date(),
           },
         });
@@ -1135,6 +1233,16 @@ interface ShopifyOrder {
   displayFinancialStatus: string;
   displayFulfillmentStatus: string;
   totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+  subtotalPriceSet?: {
+    shopMoney: { amount: string; currencyCode: string };
+  } | null;
+  totalShippingPriceSet?: {
+    shopMoney: { amount: string; currencyCode: string };
+  } | null;
+  totalTaxSet?: { shopMoney: { amount: string; currencyCode: string } } | null;
+  currentTotalDiscountSet?: {
+    shopMoney: { amount: string; currencyCode: string };
+  } | null;
   customer: {
     id: string;
     firstName: string;

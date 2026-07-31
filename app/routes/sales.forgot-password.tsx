@@ -46,26 +46,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const resetToken = randomUUID();
   const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-  await prisma.user.update({
-    where: { id: user.id },
-    data: {
-      passwordResetToken: resetToken,
-      passwordResetExpiresAt: expiresAt,
-    },
-  });
-
-  const appUrl = process.env.SHOPIFY_APP_URL || "https://example.com";
+  const requestUrl = new URL(request.url);
+  const appUrl = (process.env.SHOPIFY_APP_URL || requestUrl.origin || "https://example.com").replace(/\/$/, "");
   const resetLink = `${appUrl}/sales/reset-password?token=${resetToken}&email=${encodeURIComponent(user.email)}`;
 
   try {
-    await sendSalesUserPasswordResetEmail({
+    const emailResult = await sendSalesUserPasswordResetEmail({
       storeId: user.shopId,
       email: user.email,
       firstName: user.firstName || "there",
       resetLink,
     });
+
+    if (!emailResult.success) {
+      console.error("Sales forgot-password email failed", emailResult.error);
+      return Response.json({ error: "We could not send the password reset email right now. Please try again in a few minutes." });
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordResetToken: resetToken,
+        passwordResetExpiresAt: expiresAt,
+      },
+    });
   } catch (error) {
     console.error("Sales forgot-password email error", error);
+    return Response.json({ error: "We could not send the password reset email right now. Please try again in a few minutes." });
   }
 
   return Response.json({ success: "If an account exists for that email, we’ll send reset instructions shortly." });

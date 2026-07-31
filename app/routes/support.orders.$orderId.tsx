@@ -79,6 +79,25 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }),
   ]);
   const deliveryDetails = await getShopifyDeliveryDetails(order);
+  const shopifyOrderDetails = await getShopifyOrderDetails(order);
+  const orderItems = (order.items.length > 0
+    ? order.items
+    : shopifyOrderDetails?.items || []).map((item: any, index: number) => ({
+    id: item.id || `shopify-item-${index}`,
+    productId: item.productId,
+    productTitle: item.productTitle,
+    variantId: item.variantId,
+    variantTitle: item.variantTitle,
+    sku: item.sku,
+    image: item.image,
+    quantity: item.quantity,
+    unitPrice: String(item.unitPrice ?? "0"),
+    discount: String(item.discount ?? "0"),
+    lineTotal: String(item.lineTotal ?? "0"),
+    createdAt: item.createdAt?.toISOString?.() || null,
+    updatedAt: item.updatedAt?.toISOString?.() || null,
+  }));
+
   return Response.json({
     user: {
       firstName: user.firstName,
@@ -98,6 +117,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     })),
     order: {
       ...order,
+      shopifyOrderName: shopifyOrderDetails?.shopifyOrderName || null,
+      customerName: order.customerName || shopifyOrderDetails?.customerName || null,
+      customerEmail: order.customerEmail || shopifyOrderDetails?.customerEmail || null,
+      customerPhone: shopifyOrderDetails?.customerPhone || null,
+      shopifyPaymentStatus: shopifyOrderDetails?.paymentStatus || null,
+      shopifyFulfillmentStatus: shopifyOrderDetails?.fulfillmentStatus || null,
       orderNumber: getOrderNumber(order),
       orderTotal: order.orderTotal.toString(),
       paidAmount: order.paidAmount.toString(),
@@ -108,12 +133,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       shippingAmount: order.shippingAmount.toString(),
       createdAt: order.createdAt.toISOString(),
       updatedAt: order.updatedAt.toISOString(),
-      items: order.items.map((item) => ({
-        ...item,
-        unitPrice: item.unitPrice.toString(),
-        discount: item.discount.toString(),
-        lineTotal: item.lineTotal.toString(),
-      })),
+      items: orderItems,
       payments: order.payments.map((payment) => ({
         ...payment,
         amount: payment.amount.toString(),
@@ -287,6 +307,210 @@ async function getShopifyDeliveryDetails(order: any): Promise<DeliveryDetails> {
       error: error instanceof Error ? error.message : String(error),
     });
     return getCompanyLocationDeliveryDetails(order, empty);
+  }
+}
+
+async function getShopifyOrderDetails(order: any) {
+  const shopDomain = order.company?.shop?.shopDomain;
+  const accessToken = order.company?.shop?.accessToken;
+  const shopifyOrder = normalizeShopifyOrderId(order);
+  if (!shopDomain || !accessToken || !shopifyOrder) return null;
+
+  try {
+    const query = `
+        query GetShopifyOrderDetails($id: ID!) {
+          node(id: $id) {
+            ... on Order {
+              id
+              name
+              displayFinancialStatus
+              displayFulfillmentStatus
+              customer {
+                firstName
+                lastName
+                email
+                phone
+              }
+              lineItems(first: 250) {
+              edges {
+                node {
+                  id
+                  title
+                  quantity
+                  sku
+                  variantTitle
+                  originalUnitPriceSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  discountedTotalSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                }
+              }
+            }
+          }
+          ... on DraftOrder {
+            id
+            name
+            displayFinancialStatus
+            displayFulfillmentStatus
+            customer {
+              firstName
+              lastName
+              email
+              phone
+            }
+            lineItems(first: 250) {
+              edges {
+                node {
+                  id
+                  title
+                  quantity
+                  sku
+                  variantTitle
+                  originalUnitPriceSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  discountedTotalSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const response = await fetch(
+      `https://${shopDomain}/admin/api/2025-01/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": accessToken,
+        },
+        body: JSON.stringify({
+          query,
+          variables: { id: shopifyOrder.id },
+        }),
+      },
+    );
+
+    const payload = await response.json();
+    if (payload.errors?.length) {
+      console.warn("[support-order] Shopify order details lookup failed", {
+        orderId: order.id,
+        errors: payload.errors,
+      });
+      return null;
+    }
+
+    const node = payload.data?.node;
+    if (!node) return null;
+
+    const customerName = [
+      node.customer?.firstName,
+      node.customer?.lastName,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    const customerEmail = node.customer?.email || null;
+    const items = (node.lineItems?.edges || [])
+      .map((edge: any) => edge.node)
+      .filter(Boolean)
+      .map((item: any) => {
+        const unitPrice = item.originalUnitPriceSet?.shopMoney?.amount || "0";
+        const lineTotal = item.discountedTotalSet?.shopMoney?.amount || "0";
+        const quantity = Number(item.quantity || 0);
+        const discount = Math.max(
+          0,
+          quantity * Number(unitPrice) - Number(lineTotal),
+        );
+
+        return {
+          id: item.id || null,
+          productId: null,
+          productTitle: item.title || "Product",
+          variantId: null,
+          variantTitle: item.variantTitle || null,
+          sku: item.sku || null,
+          image: null,
+          quantity,
+          unitPrice: unitPrice || "0",
+          discount: String(discount.toFixed(2)),
+          lineTotal: String(lineTotal || "0"),
+        };
+      });
+
+    return {
+      shopifyOrderName: node.name || null,
+      customerName: customerName || null,
+      customerEmail,
+      customerPhone: node.customer?.phone || null,
+      paymentStatus: normalizeShopifyFinancialStatus(
+        node.displayFinancialStatus,
+      ),
+      fulfillmentStatus: normalizeShopifyFulfillmentStatus(
+        node.displayFulfillmentStatus,
+      ),
+      items,
+    };
+  } catch (error) {
+    console.error("[support-order] Shopify order details unavailable", {
+      orderId: order.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function normalizeShopifyFinancialStatus(status?: string | null) {
+  const value = String(status || "").toLowerCase().replace(/[\s_-]/g, "");
+  switch (value) {
+    case "paid":
+      return "paid";
+    case "partiallypaid":
+      return "partial";
+    case "partiallyrefunded":
+      return "partial";
+    case "pending":
+    case "authorized":
+      return "pending";
+    case "refunded":
+      return "refunded";
+    case "voided":
+      return "cancelled";
+    default:
+      return value || null;
+  }
+}
+
+function normalizeShopifyFulfillmentStatus(status?: string | null) {
+  const value = String(status || "").toLowerCase().replace(/[\s_-]/g, "");
+  switch (value) {
+    case "fulfilled":
+      return "fulfilled";
+    case "partiallyfulfilled":
+      return "partial";
+    case "unfulfilled":
+    case "scheduled":
+      return "unfulfilled";
+    default:
+      return value || null;
   }
 }
 
@@ -815,7 +1039,7 @@ export default function OrderDetailsPage() {
         Back to Orders
       </Link>
       <SalesPortalHeader
-        title={order.orderNumber}
+        title={order.shopifyOrderName || order.orderNumber}
         subtitle={`${order.customerName || order.customerEmail || "Customer not captured"} · Created ${date(order.createdAt)}`}
         companyId={order.company.id}
         companies={data.companies}
@@ -875,6 +1099,14 @@ export default function OrderDetailsPage() {
           <Card title="Order Information">
             <div className="order-info-grid" style={styles.infoGrid}>
               <Info label="Order Number" value={order.orderNumber} />
+              <Info
+                label="Shopify Order"
+                value={
+                  order.shopifyOrderName ||
+                  order.shopifyOrderId?.split("/").pop() ||
+                  "Not captured"
+                }
+              />
               <Info label="Company" value={order.company.name} />
               <Info
                 label="Customer"
@@ -883,6 +1115,10 @@ export default function OrderDetailsPage() {
               <Info
                 label="Customer Email"
                 value={order.customerEmail || "Not captured"}
+              />
+              <Info
+                label="Customer Phone"
+                value={order.customerPhone || "Not captured"}
               />
               <Info
                 label="Sales Agent"
@@ -901,7 +1137,11 @@ export default function OrderDetailsPage() {
               <Info label="Order Status" value={label(order.orderStatus)} />
               <Info
                 label="Payment Status"
-                value={paymentLabel(order.paymentStatus)}
+                value={paymentLabel(order.shopifyPaymentStatus || order.paymentStatus)}
+              />
+              <Info
+                label="Fulfillment Status"
+                value={label(order.shopifyFulfillmentStatus || "Not captured")}
               />
             </div>
           </Card>
