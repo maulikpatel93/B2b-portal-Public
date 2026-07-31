@@ -1,6 +1,19 @@
 import prisma from "../db.server";
 import { Prisma } from "@prisma/client";
 
+export interface OrderItemInput {
+  productId?: string | null;
+  productTitle: string;
+  variantId?: string | null;
+  variantTitle?: string | null;
+  sku?: string | null;
+  image?: string | null;
+  quantity: number;
+  unitPrice: number | Prisma.Decimal;
+  discount?: number | Prisma.Decimal;
+  lineTotal: number | Prisma.Decimal;
+}
+
 export interface CreateOrderInput {
   companyId: string;
   createdByUserId: string;
@@ -10,11 +23,113 @@ export interface CreateOrderInput {
   creditUsed: number | Prisma.Decimal;
   userCreditUsed: number | Prisma.Decimal; // Add missing field
   remainingBalance: number | Prisma.Decimal;
+  paidAmount?: number | Prisma.Decimal;
   paymentStatus?: string;
   orderStatus?: string;
   notes?: string; // Add optional notes field
   source?: string | null;
   userId?: string;
+  // Shopify-sourced order details
+  orderNumber?: string | null;
+  customerName?: string | null;
+  customerEmail?: string | null;
+  customerId?: string | null;
+  currencyCode?: string | null;
+  items?: OrderItemInput[];
+}
+
+/**
+ * Map a Shopify REST/GraphQL financial status onto the Sales Portal's own
+ * payment/order status vocabulary, along with derived paid/remaining amounts.
+ * Falls back to a pending order for unknown/authorized/null statuses.
+ */
+export function mapShopifyFinancialStatus(
+  financialStatus: string | null | undefined,
+  orderTotal: number | Prisma.Decimal,
+): {
+  paymentStatus: string;
+  orderStatus: string;
+  paidAmount: Prisma.Decimal;
+  remainingBalance: Prisma.Decimal;
+} {
+  const total = new Prisma.Decimal(orderTotal.toString());
+  const zero = new Prisma.Decimal(0);
+  const status = (financialStatus || "").toLowerCase();
+
+  switch (status) {
+    case "paid":
+      return {
+        paymentStatus: "paid",
+        orderStatus: "completed",
+        paidAmount: total,
+        remainingBalance: zero,
+      };
+    case "partially_paid":
+      return {
+        paymentStatus: "partial",
+        orderStatus: "processing",
+        paidAmount: zero,
+        remainingBalance: total,
+      };
+    case "refunded":
+    case "partially_refunded":
+      return {
+        paymentStatus: "paid",
+        orderStatus: "refunded",
+        paidAmount: total,
+        remainingBalance: zero,
+      };
+    case "voided":
+      return {
+        paymentStatus: "failed",
+        orderStatus: "cancelled",
+        paidAmount: zero,
+        remainingBalance: total,
+      };
+    default:
+      return {
+        paymentStatus: "pending",
+        orderStatus: "payment_pending",
+        paidAmount: zero,
+        remainingBalance: total,
+      };
+  }
+}
+
+function mapOrderItemsForCreate(items: OrderItemInput[] | undefined) {
+  if (!items?.length) return undefined;
+  return items.map((item) => ({
+    productId: item.productId ?? null,
+    productTitle: item.productTitle || item.variantTitle || "Product",
+    variantId: item.variantId ?? null,
+    variantTitle: item.variantTitle ?? null,
+    sku: item.sku ?? null,
+    image: item.image ?? null,
+    quantity: item.quantity,
+    unitPrice: new Prisma.Decimal(item.unitPrice.toString()),
+    discount: new Prisma.Decimal((item.discount ?? 0).toString()),
+    lineTotal: new Prisma.Decimal(item.lineTotal.toString()),
+  }));
+}
+
+/**
+ * Shared write-data for the Shopify-sourced detail fields. Only includes a
+ * field when the caller supplied it, so existing callers stay unaffected.
+ * When items are provided, existing line items are replaced.
+ */
+function buildOrderDetailData(
+  data: CreateOrderInput,
+): Prisma.B2BOrderUpdateInput {
+  const detail: Prisma.B2BOrderUpdateInput = {};
+  if (data.orderNumber !== undefined) detail.orderNumber = data.orderNumber;
+  if (data.customerName !== undefined) detail.customerName = data.customerName;
+  if (data.customerEmail !== undefined)
+    detail.customerEmail = data.customerEmail;
+  if (data.customerId !== undefined) detail.customerId = data.customerId;
+  if (data.currencyCode) detail.currencyCode = data.currencyCode;
+  const items = mapOrderItemsForCreate(data.items);
+  if (items) detail.items = { deleteMany: {}, create: items };
+  return detail;
 }
 
 export interface UpdateOrderInput {
@@ -119,10 +234,14 @@ export async function upsertOrder(data: CreateOrderInput) {
         creditUsed: new Prisma.Decimal(data.creditUsed.toString()),
         userCreditUsed: new Prisma.Decimal(data.userCreditUsed.toString()),
         remainingBalance: new Prisma.Decimal(data.remainingBalance.toString()),
+        ...(data.paidAmount !== undefined
+          ? { paidAmount: new Prisma.Decimal(data.paidAmount.toString()) }
+          : {}),
         paymentStatus: data.paymentStatus || "pending",
         orderStatus: data.orderStatus || "draft",
         notes: data.notes,
         source: data.source,
+        ...buildOrderDetailData(data),
       },
       include: {
         company: true,
@@ -157,10 +276,14 @@ export async function upsertOrder(data: CreateOrderInput) {
           creditUsed: new Prisma.Decimal(data.creditUsed.toString()),
           userCreditUsed: new Prisma.Decimal(data.userCreditUsed.toString()),
           remainingBalance: new Prisma.Decimal(data.remainingBalance.toString()),
+          ...(data.paidAmount !== undefined
+            ? { paidAmount: new Prisma.Decimal(data.paidAmount.toString()) }
+            : {}),
           paymentStatus: data.paymentStatus || "pending",
           orderStatus: data.orderStatus || "draft",
           notes: data.notes,
           source: data.source,
+          ...buildOrderDetailData(data),
         },
         include: {
           company: true,

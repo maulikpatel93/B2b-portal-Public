@@ -9,6 +9,7 @@ import { PLAN_99, CUSTOM_PLAN } from "app/billing-plans.shared";
 import { hasCustomPlanConfiguration } from "app/services/store.server";
 import { sendSalesUserInvitationEmail } from "app/utils/email";
 import { syncCompaniesFromShopify, syncCompaniesAndDetails } from "app/services/company.server";
+import { syncShopifyUsers, syncShopifyOrders } from "app/utils/company.server";
 
 const COMPANY_PICKER_LARGE_LIST_THRESHOLD = 100;
 const COMPANY_PICKER_PAGE_SIZE = 50;
@@ -321,9 +322,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }, { status: 400 });
     }
     
-    await prisma.user.delete({
+    const deleteResult = await prisma.user.deleteMany({
       where: { id: userId, shopId: store.id },
     });
+
+    if (deleteResult.count === 0) {
+      return Response.json({
+        error: "User could not be deleted because it no longer exists or is not assigned to this store.",
+        intent: "delete"
+      }, { status: 404 });
+    }
     
     // Clear the cache so deletion shows up immediately
     const cacheKey = `sales-users-${session.shop}`;
@@ -397,10 +405,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "sync_companies") {
     try {
       const admin = await getAdminForShop(session.shop);
-      // Use the extended sync which also fetches customers & locations
       const result = await syncCompaniesAndDetails(store.id, admin);
 
-      // Clear the cache so new companies show up immediately
       const cacheKey = `sales-users-${session.shop}`;
       salesUsersCache.delete(cacheKey);
 
@@ -425,6 +431,75 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (intent === "sync_user_companies") {
+    const userId = formData.get("userId") as string;
+    if (!userId) {
+      return Response.json({ success: false, error: "User ID is required" });
+    }
+
+    try {
+      const admin = await getAdminForShop(session.shop);
+
+      const userCompanies = await prisma.salesUserCompany.findMany({
+        where: { userId },
+        include: { company: { select: { id: true, name: true } } },
+      });
+
+      if (userCompanies.length === 0) {
+        return Response.json({
+          success: true,
+          intent: "sync_user_companies",
+          message: "No companies assigned to this user.",
+        });
+      }
+
+      let usersSynced = 0;
+      let ordersSynced = 0;
+      const errors: string[] = [];
+
+      for (const { company } of userCompanies) {
+        const userSyncResult = await syncShopifyUsers(admin, store, company.id);
+        if (userSyncResult.success) {
+          usersSynced += userSyncResult.syncedCount || 0;
+        } else {
+          errors.push(
+            `"${company.name}" user sync: ${userSyncResult.message || "failed"}`,
+          );
+        }
+
+        const orderSyncResult = await syncShopifyOrders(admin, store, company.id);
+        if (orderSyncResult.success) {
+          ordersSynced += orderSyncResult.syncedCount || 0;
+        } else {
+          errors.push(
+            `"${company.name}" order sync: ${orderSyncResult.message || "failed"}`,
+          );
+        }
+      }
+
+      const cacheKey = `sales-users-${session.shop}`;
+      salesUsersCache.delete(cacheKey);
+
+      return Response.json({
+        success: true,
+        intent: "sync_user_companies",
+        message:
+          `Synced ${userCompanies.length} compan${userCompanies.length === 1 ? "y" : "ies"}` +
+          ` — ${usersSynced} user${usersSynced === 1 ? "" : "s"} synced, ${ordersSynced} order${ordersSynced === 1 ? "" : "s"} synced` +
+          (errors.length ? `; Errors: ${errors.join("; ")}` : ""),
+        usersSynced,
+        ordersSynced,
+        errors,
+      });
+    } catch (error: any) {
+      console.error("Error syncing user companies:", error);
+      return Response.json({
+        success: false,
+        error: error.message || "Failed to sync user companies from Shopify",
+      });
+    }
+  }
+
   return Response.json({ success: false, error: "Unknown intent" });
 };
 
@@ -436,6 +511,7 @@ export default function SalesUsers() {
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [syncingUserIds, setSyncingUserIds] = useState<Set<string>>(new Set());
   const [isCreating, setIsCreating] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
@@ -526,7 +602,10 @@ export default function SalesUsers() {
       } else if (fetcher.data?.success && fetcher.data?.intent === "sync_companies") {
         setSyncMessage(fetcher.data.message);
         setIsSyncing(false);
-        // Clear message after 3 seconds
+        setTimeout(() => setSyncMessage(""), 3000);
+      } else if (fetcher.data?.success && fetcher.data?.intent === "sync_user_companies") {
+        setSyncingUserIds(new Set());
+        setSyncMessage(fetcher.data.message);
         setTimeout(() => setSyncMessage(""), 3000);
       } else if (fetcher.data?.success && fetcher.data?.intent === "delete") {
         setDeleteError("");
@@ -536,6 +615,9 @@ export default function SalesUsers() {
         if (fetcher.data?.intent === "sync_companies") {
           setSyncMessage(`Error: ${fetcher.data.error}`);
           setIsSyncing(false);
+        } else if (fetcher.data?.intent === "sync_user_companies") {
+          setSyncingUserIds(new Set());
+          setSyncMessage(`Error: ${fetcher.data.error}`);
         } else if (fetcher.data?.intent === "update") {
           setEditErrorMessage(fetcher.data.error);
           setIsUpdating(false);
@@ -651,6 +733,15 @@ export default function SalesUsers() {
     setSyncMessage("");
     fetcher.submit(
       { intent: "sync_companies" },
+      { method: "post" }
+    );
+  };
+
+  const handleSyncUserCompanies = (userId: string) => {
+    setSyncingUserIds((prev) => new Set(prev).add(userId));
+    setSyncMessage("");
+    fetcher.submit(
+      { intent: "sync_user_companies", userId },
       { method: "post" }
     );
   };
@@ -772,16 +863,16 @@ export default function SalesUsers() {
               {link && (
                 <>
                   <Button size="micro" onClick={() => handleResendEmail(id)}>Resend Email</Button>
-                  {/* <Button size="micro" onClick={() => navigator.clipboard.writeText(link)}>
-                    Copy Invite Link
-                  </Button> */}
                 </>
               )}
-              {/* {isApproved && (
-                <Button size="micro" onClick={() => navigator.clipboard.writeText(portalLoginUrl)}>
-                  Copy Portal Login
-                </Button>
-              )} */}
+              <Button
+                size="micro"
+                onClick={() => handleSyncUserCompanies(id)}
+                loading={syncingUserIds.has(id)}
+                disabled={syncingUserIds.has(id)}
+              >
+                {syncingUserIds.has(id) ? "Syncing..." : "Sync Company"}
+              </Button>
               <Button size="micro" tone="critical" onClick={() => handleDelete(id)}>Delete</Button>
             </InlineStack>
           </IndexTable.Cell>

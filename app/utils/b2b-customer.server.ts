@@ -414,29 +414,47 @@ export async function assignCompanyToCustomer(
       admin.graphql(companyQuery, { variables: { companyId } }),
     ]);
 
-    const [locationJson, companyJson] = (await Promise.all([
-      locationRes.json(),
-      companyRes.json(),
-    ])) as [
-      GraphQLResponse<{
-        company?: {
-          locations?: {
-            edges?: Array<{
-              node: { id: string; name: string };
-            }>;
-          } | null;
+    const [locationText, companyText] = await Promise.all([
+      locationRes.text(),
+      companyRes.text(),
+    ]);
+
+    let locationJson: GraphQLResponse<{
+      company?: {
+        locations?: {
+          edges?: Array<{
+            node: { id: string; name: string };
+          }>;
         } | null;
-      }>,
-      GraphQLResponse<{
-        company?: {
-          contactRoles?: {
-            edges?: Array<{
-              node: { id: string; name: string };
-            }>;
-          } | null;
+      } | null;
+    }>;
+    let companyJson: GraphQLResponse<{
+      company?: {
+        contactRoles?: {
+          edges?: Array<{
+            node: { id: string; name: string };
+          }>;
         } | null;
-      }>,
-    ];
+      } | null;
+    }>;
+    try {
+      locationJson = JSON.parse(locationText);
+    } catch {
+      return {
+        success: false,
+        error: `Shopify returned non-JSON response for company locations query (status ${locationRes.status}): ${locationText.slice(0, 200)}`,
+        step: "getCompanyLocations",
+      };
+    }
+    try {
+      companyJson = JSON.parse(companyText);
+    } catch {
+      return {
+        success: false,
+        error: `Shopify returned non-JSON response for company contact roles query (status ${companyRes.status}): ${companyText.slice(0, 200)}`,
+        step: "getRoles",
+      };
+    }
 
     if (locationJson.errors?.length) {
       return {
