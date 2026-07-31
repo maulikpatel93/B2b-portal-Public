@@ -52,8 +52,7 @@ export async function createUser(data: CreateUserInput) {
       companyRole: data.companyRole,
       shopifyCustomerId: data.shopifyCustomerId,
       isActive: true,
-      userCreditLimit:data.userCreditLimit || 0,
-
+      userCreditLimit: data.userCreditLimit || 0,
     },
     include: {
       shop: true,
@@ -69,7 +68,7 @@ export async function getUserById(id: string, shopId: string) {
   return await prisma.user.findFirst({
     where: {
       shopifyCustomerId: id,
-      shopId // Ensure user belongs to the requesting shop
+      shopId, // Ensure user belongs to the requesting shop
     },
     include: {
       shop: true,
@@ -176,7 +175,11 @@ export async function getUsersByCompany(
 /**
  * Update a user with shop validation
  */
-export async function updateUser(id: string, shopId: string, data: UpdateUserInput) {
+export async function updateUser(
+  id: string,
+  shopId: string,
+  data: UpdateUserInput,
+) {
   // First verify the user belongs to the shop
   const existingUser = await prisma.user.findFirst({
     where: { id, shopId },
@@ -214,9 +217,15 @@ export async function deleteUser(id: string, shopId: string) {
     throw new Error("User not found or does not belong to this shop");
   }
 
-  return await prisma.user.delete({
-    where: { id },
+  const deleteResult = await prisma.user.deleteMany({
+    where: { id, shopId },
   });
+
+  if (deleteResult.count === 0) {
+    throw new Error("User not found or does not belong to this shop");
+  }
+
+  return { success: true };
 }
 
 /**
