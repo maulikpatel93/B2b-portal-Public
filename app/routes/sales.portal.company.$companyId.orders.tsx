@@ -32,10 +32,13 @@ import {
 } from "app/components/SalesPortalLayout";
 import {
   getOrCreateSalesOrderPaymentLink,
+  getOrderNumber,
   getShopifyOrderWhere,
   isSalesPortalPaymentLinkEligible,
   logOrderActivity,
+  fetchShopifyOrderNames,
 } from "app/services/sales-order-management.server";
+import { createUser } from "app/services/user.server";
 import {
   formatPhoneNumberForCountry,
   getDialCodeForCountry,
@@ -102,24 +105,33 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     select: {
       id: true,
       shopifyOrderId: true,
+      orderNumber: true,
       orderTotal: true,
       paymentStatus: true,
       orderStatus: true,
       createdAt: true,
       remainingBalance: true,
       currencyCode: true,
+      customerName: true,
       customerEmail: true,
       source: true,
       paymentLink: true,
       paymentLinkToken: true,
+      items: { select: { quantity: true } },
       company: {
-        select: { id: true, name: true },
+        select: {
+          id: true,
+          name: true,
+          shop: { select: { shopDomain: true, accessToken: true } },
+        },
       },
       createdByUser: {
         select: { firstName: true, lastName: true, email: true },
       },
     },
   });
+
+  const orderNames = await fetchShopifyOrderNames(orders);
 
   const quoteCount =
     selectedCompanyId === "all"
@@ -145,13 +157,28 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       storeName: null,
     },
     orders: orders.map((o) => ({
-      ...o,
+      id: o.id,
+      shopifyOrderId: o.shopifyOrderId,
+      orderNumber: getOrderNumber(o),
+      shopifyOrderName: orderNames.get(o.id) || null,
       orderTotal: o.orderTotal?.toString() || "0",
+      paymentStatus: o.paymentStatus,
+      orderStatus: o.orderStatus,
       remainingBalance: o.remainingBalance?.toString() || "0",
+      currencyCode: o.currencyCode,
+      customerName: o.customerName,
+      customerEmail: o.customerEmail,
+      source: o.source,
+      paymentLink: o.paymentLink,
+      paymentLinkToken: o.paymentLinkToken,
+      itemCount: o.items.length,
+      quantity: o.items.reduce((sum, item) => sum + item.quantity, 0),
       createdAt: o.createdAt.toISOString(),
       canGeneratePaymentLink: isSalesPortalPaymentLinkEligible(o),
       companyName: o.company?.name || null,
+      createdByUser: o.createdByUser,
     })),
+    createOrderCompanyId: companies[0]?.id || "",
     quoteCount,
     allCompanies: companies,
     selectedCompanyId,
@@ -401,6 +428,37 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       select: { id: true },
     });
 
+    const existingLocalUser = await prisma.user.findFirst({
+      where: { email: customerEmail, shopId: store.id },
+    });
+
+    if (existingLocalUser) {
+      await prisma.user.update({
+        where: { id: existingLocalUser.id },
+        data: {
+          companyId: newCompany.id,
+          shopifyCustomerId: customerId,
+          firstName: firstName || existingLocalUser.firstName,
+          lastName: lastName || existingLocalUser.lastName,
+          status: "APPROVED",
+        },
+      });
+    } else {
+      await createUser({
+        email: customerEmail,
+        firstName,
+        lastName,
+        password: "",
+        role: "STORE_USER",
+        status: "APPROVED",
+        shopId: store.id,
+        companyId: newCompany.id,
+        companyRole: "member",
+        shopifyCustomerId: customerId,
+        userCreditLimit: 0,
+      });
+    }
+
     return redirect(
       `/sales/portal/company/${newCompany.id}/orders?companyCreated=1`,
     );
@@ -603,7 +661,15 @@ export default function OrderManageScreen() {
   // NEW: controls whether the toast is currently visible (manual dismiss)
   const [toastDismissed, setToastDismissed] = useState(false);
 
-  const { user, company, orders, quoteCount, allCompanies, selectedCompanyId } = useLoaderData<{
+  const {
+    user,
+    company,
+    orders,
+    quoteCount,
+    allCompanies,
+    selectedCompanyId,
+    createOrderCompanyId,
+  } = useLoaderData<{
     user: {
       id: string;
       firstName: string | null;
@@ -620,24 +686,30 @@ export default function OrderManageScreen() {
     orders: Array<{
       id: string;
       shopifyOrderId: string | null;
+      orderNumber: string;
+      shopifyOrderName: string | null;
       orderTotal: string;
       paymentStatus: string;
       orderStatus: string;
       createdAt: string;
       remainingBalance: string;
       currencyCode: string;
+      customerName: string | null;
       customerEmail: string | null;
       source: string | null;
       paymentLink: string | null;
       paymentLinkToken: string | null;
       canGeneratePaymentLink: boolean;
       companyName: string | null;
+      itemCount: number;
+      quantity: number;
       createdByUser: {
         firstName: string | null;
         lastName: string | null;
         email: string;
       } | null;
     }>;
+    createOrderCompanyId: string;
     quoteCount: number;
     allCompanies: Array<{ id: string; name: string }>;
     selectedCompanyId: string;
@@ -1086,10 +1158,14 @@ export default function OrderManageScreen() {
               <thead>
                 <tr>
                   <th style={styles.th}>Order ID</th>
-                  <th style={styles.th}>Shopify Name</th>
+                  <th style={styles.th}>Order Number</th>
+                  <th style={styles.th}>Shopify Order</th>
+                  <th style={styles.th}>Customer</th>
                   {selectedCompanyId === "all" && <th style={styles.th}>Company</th>}
                   <th style={styles.th}>Created By</th>
                   <th style={styles.th}>Date</th>
+                  <th style={styles.th}>Items</th>
+                  <th style={styles.th}>Quantity</th>
                   <th style={styles.th}>Total</th>
                   <th style={styles.th}>Payment Status</th>
                   <th style={styles.th}>Order Status</th>
@@ -1115,10 +1191,21 @@ export default function OrderManageScreen() {
                       </td>
                       <td style={styles.td}>
                         <strong style={{ color: "#2c6ecb" }}>
-                          {order.shopifyOrderId
-                            ? `#${order.shopifyOrderId.split("/").pop()}`
-                            : "N/A"}
+                          {order.orderNumber}
                         </strong>
+                      </td>
+                      <td style={styles.td}>
+                        <span style={{ fontSize: 13, color: "#374151" }}>
+                          {order.shopifyOrderName ||
+                            (order.shopifyOrderId
+                              ? `#${order.shopifyOrderId.split("/").pop()}`
+                              : "N/A")}
+                        </span>
+                      </td>
+                      <td style={styles.td}>
+                        <span style={{ fontSize: 13, color: "#374151" }}>
+                          {order.customerName || order.customerEmail || "—"}
+                        </span>
                       </td>
                       {selectedCompanyId === "all" && (
                         <td style={styles.td}>
@@ -1133,6 +1220,8 @@ export default function OrderManageScreen() {
                           : "System"}
                       </td>
                       <td style={styles.td}>{formatDate(order.createdAt)}</td>
+                      <td style={styles.td}>{order.itemCount}</td>
+                      <td style={styles.td}>{order.quantity}</td>
                       <td style={styles.td}>
                         <strong>
                           {formatCurrency(order.orderTotal, order.currencyCode)}

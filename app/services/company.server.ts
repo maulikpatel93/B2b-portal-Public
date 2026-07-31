@@ -5,6 +5,7 @@ import {
   parseCredit,
   syncShopifyUsers,
   syncShopifyCompanies,
+  syncShopifyOrders,
 } from "app/utils/company.server";
 import {
   getCompanyCustomers,
@@ -1362,7 +1363,7 @@ export async function syncCompaniesFromShopify(shopId: string, admin: any) {
     // Upsert each company into the database
     for (const edge of uniqueCompanies) {
       const company = edge.node;
-      const shopifyCompanyId = company.id.replace("gid://shopify/Company/", "");
+      const shopifyCompanyId = company.id;
       const normalizedName = company.name.trim().toLowerCase();
 
       try {
@@ -1467,6 +1468,8 @@ export async function syncCompaniesAndDetails(shopId: string, admin: any) {
   let totalLocations = 0;
   let companiesWithSyncedUsers = 0;
   let usersSynced = 0;
+  let companiesWithSyncedOrders = 0;
+  let ordersSynced = 0;
   const errors: string[] = [];
 
   for (const comp of companies) {
@@ -1518,6 +1521,16 @@ export async function syncCompaniesAndDetails(shopId: string, admin: any) {
           `Company ${comp.id} user sync failed: ${userSyncResult.message || userSyncResult.errors?.join(", ") || "unknown"}`,
         );
       }
+
+      const orderSyncResult = await syncShopifyOrders(admin, store, comp.id);
+      if (orderSyncResult.success) {
+        companiesWithSyncedOrders++;
+        ordersSynced += orderSyncResult.syncedCount || 0;
+      } else {
+        errors.push(
+          `Company ${comp.id} order sync failed: ${orderSyncResult.message || orderSyncResult.errors?.join(", ") || "unknown"}`,
+        );
+      }
     } catch (err: any) {
       console.error(`Error fetching details for company ${comp.id}:`, err);
       errors.push(`Company ${comp.id}: ${err?.message || String(err)}`);
@@ -1527,7 +1540,7 @@ export async function syncCompaniesAndDetails(shopId: string, admin: any) {
   return {
     success: true,
     message:
-      `Synced companies. Companies with customers: ${companiesWithCustomers}, companies with locations: ${companiesWithLocations}, companies with user sync: ${companiesWithSyncedUsers}` +
+      `Synced companies. Companies with customers: ${companiesWithCustomers}, companies with locations: ${companiesWithLocations}, companies with user sync: ${companiesWithSyncedUsers}, companies with order sync: ${companiesWithSyncedOrders}` +
       (errors.length ? `; Errors: ${errors.join("; ")}` : ""),
     createdCount: 0,
     updatedCount: 0,
@@ -1536,6 +1549,8 @@ export async function syncCompaniesAndDetails(shopId: string, admin: any) {
     companiesWithLocations,
     companiesWithSyncedUsers,
     usersSynced,
+    companiesWithSyncedOrders,
+    ordersSynced,
     errors,
     totalCustomers,
     totalLocations,

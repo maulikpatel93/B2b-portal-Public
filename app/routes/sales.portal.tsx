@@ -34,6 +34,7 @@ import {
   getShopifyOrderWhere,
 } from "app/services/sales-order-management.server";
 import { getCreditSummary } from "app/services/creditService";
+import { createUser } from "app/services/user.server";
 import {
   formatPhoneNumberForCountry,
   getDialCodeForCountry,
@@ -493,6 +494,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
       select: { id: true },
     });
+
+    const existingLocalUser = await prisma.user.findFirst({
+      where: { email: customerEmail, shopId: store.id },
+    });
+
+    if (existingLocalUser) {
+      await prisma.user.update({
+        where: { id: existingLocalUser.id },
+        data: {
+          companyId: company.id,
+          shopifyCustomerId: customerId,
+          firstName: firstName || existingLocalUser.firstName,
+          lastName: lastName || existingLocalUser.lastName,
+          status: "APPROVED",
+        },
+      });
+    } else {
+      await createUser({
+        email: customerEmail,
+        firstName,
+        lastName,
+        password: "",
+        role: "STORE_USER",
+        status: "APPROVED",
+        shopId: store.id,
+        companyId: company.id,
+        companyRole: "member",
+        shopifyCustomerId: customerId,
+        userCreditLimit: 0,
+      });
+    }
 
     return redirect(`/sales/portal?companyId=${company.id}&companyCreated=1`);
   }

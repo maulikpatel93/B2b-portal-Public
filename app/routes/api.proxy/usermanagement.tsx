@@ -779,7 +779,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
   }
 
-  await prisma.user.delete({ where: { id: userData.id } });
+  const deleteResult = await prisma.user.deleteMany({ where: { id: userData.id } });
+  if (deleteResult.count === 0) {
+    return Response.json(
+      { error: "User could not be deleted because it no longer exists" },
+      { status: 404 },
+    );
+  }
+
   clearCompanyUsersCache(shop, companyId);
 
   return Response.json({
