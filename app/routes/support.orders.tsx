@@ -26,6 +26,7 @@ import {
   getAccessibleOrder,
   getSalesOrderAccessLevel,
   getShopifyOrderWhere,
+  fetchShopifyOrderNames,
 } from "app/services/sales-order-management.server";
 import { restoreCredit } from "app/services/creditService";
 import {
@@ -106,7 +107,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       orderBy: { createdAt: "desc" },
       take: exportType ? undefined : 250,
       include: {
-        company: { select: { id: true, name: true } },
+        company: {
+          select: {
+            id: true,
+            name: true,
+            shop: { select: { shopDomain: true, accessToken: true } },
+          },
+        },
         createdByUser: {
           select: { id: true, firstName: true, lastName: true, email: true },
         },
@@ -139,9 +146,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
   ]);
 
+  const orderNames = await fetchShopifyOrderNames(orders);
+
   if (exportType === "csv" || exportType === "excel") {
     const headings = [
-      "Order Number",
+      "Shopify Order Name",
       "Customer",
       "Email",
       "Company",
@@ -157,7 +166,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     ];
     const separator = exportType === "excel" ? "\t" : ",";
     const rows = orders.map((order) => [
-      getOrderNumber(order),
+      orderNames.get(order.id) || getOrderNumber(order),
       order.customerName,
       order.customerEmail,
       order.company.name,
@@ -277,9 +286,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     orders: orders.map((order) => ({
       id: order.id,
       orderNumber: getOrderNumber(order),
+      shopifyOrderName: orderNames.get(order.id) || null,
       customerName: order.customerName,
       customerEmail: order.customerEmail,
-      company: order.company,
+      company: { id: order.company.id, name: order.company.name },
       salesAgent: order.createdByUser,
       itemCount: order.items.length,
       quantity: order.items.reduce((sum, item) => sum + item.quantity, 0),
@@ -615,7 +625,7 @@ export default function CentralOrderListPage() {
           <thead>
             <tr>
               {[
-                "Order Number",
+                "Order Name",
                 "Customer",
                 "Company",
                 "Sales Agent",
@@ -642,7 +652,7 @@ export default function CentralOrderListPage() {
                     to={`/sales/portal/orders/${order.id}`}
                     style={styles.orderLink}
                   >
-                    {order.orderNumber}
+                    {order.shopifyOrderName || order.orderNumber}
                   </Link>
                 </td>
                 <td style={styles.td}>
